@@ -19,17 +19,20 @@
 /* Includes ------------------------------------------------------------------*/
 #include "main.h"
 #include "cmsis_os.h"
+#include "mbedtls.h"
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "string.h"
 #include "stdlib.h"
 #include "../../ECUAL/LCD16X2/LCD16X2.h"
+#include "mbedtls/aes.h"
 
 
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
+typedef StaticTask_t osStaticThreadDef_t;
 /* USER CODE BEGIN PTD */
 
   uint16_t adc_res[5];
@@ -42,7 +45,31 @@
 
   uint8_t fan_display_status = 0 ;//0: fan off , 1: fan low on , 2: fan high on
 
+  uint8_t uart_buff[248];
 
+  int _hour , _minute , _seconds;
+
+  mbedtls_aes_context aes;
+
+  unsigned char key[16] = {0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+                           0x08, 0x09, 0x0A, 0x0B, 0x0C, 0x0D, 0x0E, 0x0F};
+
+  // Initialization Vector (IV, 16 bytes)
+  unsigned char iv[16] = {0xA1, 0xB2, 0xC3, 0xD4, 0xE5, 0xF6, 0x07, 0x18,
+                          0x29, 0x3A, 0x4B, 0x5C, 0x6D, 0x7E, 0x8F, 0x90};
+
+  char temp_result[16];
+
+  static volatile int _engine_start_valid_ = 0;  //start engine or not!
+
+  char get_encrypted_immo_data[16]; //data which recived from can bus
+
+  const char * immo_code = "2C00F64060FA";
+
+  uint8_t immo_read_ok = 0;
+
+ uint8_t read_first_byte = 0;
+ uint8_t read_second_byte = 0;
 
   //coolant level based on adc to convert
 
@@ -73,6 +100,9 @@
 
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
+#define NO_PERMISSION 0  //engine start permission by immoblizer
+#define OK_PERMISSION 1 ///engine valid start permission by immoblizer
+
 #define MyLCD LCD16X2_1
  void handle_rpm_input();
  void handle_rpm_increase();
@@ -83,6 +113,14 @@ void make_rpm_can_data(uint16_t _rpm_);
 void make_coolant_can_data(uint16_t _coolant_);
 void make_fan_can_data(uint16_t _fan_);
 void write_fan_status(); //write fan ststus on LCD
+void get_time(int *hour , int *minute , int *seconds);
+char * make_string_time(int hour , int minute);
+char * make_encrypted_data(char *plain_text);
+char *make_decrypted_data(char *cipher_text);
+uint8_t convert_can_message_immo(char *res);
+void send_encrypted_immo_data(char *chiper_text);
+void handle_valid_switch_start();
+
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -97,20 +135,32 @@ DMA_HandleTypeDef hdma_adc1;
 CAN_HandleTypeDef hcan1;
 
 UART_HandleTypeDef huart1;
+UART_HandleTypeDef huart3;
+DMA_HandleTypeDef hdma_usart3_rx;
 
 /* Definitions for defaultTask */
 osThreadId_t defaultTaskHandle;
+uint32_t defaultTaskBuffer[ 128 ];
+osStaticThreadDef_t defaultTaskControlBlock;
 const osThreadAttr_t defaultTask_attributes = {
   .name = "defaultTask",
-  .stack_size = 128 * 4,
+  .cb_mem = &defaultTaskControlBlock,
+  .cb_size = sizeof(defaultTaskControlBlock),
+  .stack_mem = &defaultTaskBuffer[0],
+  .stack_size = sizeof(defaultTaskBuffer),
   .priority = (osPriority_t) osPriorityNormal,
 };
 /* Definitions for lcd_drive */
 osThreadId_t lcd_driveHandle;
+uint32_t lcd_driveBuffer[ 512 ];
+osStaticThreadDef_t lcd_driveControlBlock;
 const osThreadAttr_t lcd_drive_attributes = {
   .name = "lcd_drive",
-  .stack_size = 128 * 4,
-  .priority = (osPriority_t) osPriorityLow,
+  .cb_mem = &lcd_driveControlBlock,
+  .cb_size = sizeof(lcd_driveControlBlock),
+  .stack_mem = &lcd_driveBuffer[0],
+  .stack_size = sizeof(lcd_driveBuffer),
+  .priority = (osPriority_t) osPriorityNormal,
 };
 /* Definitions for can_control */
 osThreadId_t can_controlHandle;
@@ -132,6 +182,18 @@ const osThreadAttr_t calculate_attributes = {
   .name = "calculate",
   .stack_size = 128 * 4,
   .priority = (osPriority_t) osPriorityLow,
+};
+/* Definitions for make_immo_data */
+osThreadId_t make_immo_dataHandle;
+uint32_t make_immo_dataBuffer[ 4096 ];
+osStaticThreadDef_t make_immo_dataControlBlock;
+const osThreadAttr_t make_immo_data_attributes = {
+  .name = "make_immo_data",
+  .cb_mem = &make_immo_dataControlBlock,
+  .cb_size = sizeof(make_immo_dataControlBlock),
+  .stack_mem = &make_immo_dataBuffer[0],
+  .stack_size = sizeof(make_immo_dataBuffer),
+  .priority = (osPriority_t) osPriorityNormal,
 };
 /* USER CODE BEGIN PV */
 
@@ -165,6 +227,8 @@ char data_to_send[45];
 CAN_TxHeaderTypeDef engine_rpm_header;
 CAN_TxHeaderTypeDef coolant_rpm_header;
 CAN_TxHeaderTypeDef fan_rpm_header;
+CAN_TxHeaderTypeDef immo_1; //fisrt byte of immoblizer (since aes makes 16 byte data we send data in two messages)
+CAN_TxHeaderTypeDef immo_2; //second byte of immoblizer (since aes makes 16 byte data we send data in two messages)
 CAN_RxHeaderTypeDef RxHeader;
 CAN_FilterTypeDef cluster_filter;
 uint32_t tx_mail_box = 0;
@@ -180,11 +244,13 @@ static void MX_DMA_Init(void);
 static void MX_CAN1_Init(void);
 static void MX_USART1_UART_Init(void);
 static void MX_ADC1_Init(void);
+static void MX_USART3_UART_Init(void);
 void StartDefaultTask(void *argument);
 void display_data(void *argument);
 void can_send_data(void *argument);
 void get_input_data(void *argument);
 void make_engine_data(void *argument);
+void make_immo_data_func(void *argument);
 
 /* USER CODE BEGIN PFP */
 
@@ -230,6 +296,9 @@ int main(void)
   MX_CAN1_Init();
   MX_USART1_UART_Init();
   MX_ADC1_Init();
+  MX_USART3_UART_Init();
+  /* Call PreOsInit function */
+  MX_MBEDTLS_Init();
   /* USER CODE BEGIN 2 */
 
   cluster_filter.FilterActivation = CAN_FILTER_ENABLE;
@@ -268,6 +337,14 @@ int main(void)
   coolant_rpm_header.IDE = CAN_ID_EXT;
   coolant_rpm_header.ExtId = 0X18FEBDFE;
   //***************************************************
+  immo_1.DLC =8;
+  immo_1.IDE = CAN_ID_EXT;
+  immo_1.ExtId = 0X1CABBAEE;
+  //***************************************************
+  immo_2.DLC =8;
+  immo_2.IDE = CAN_ID_EXT;
+  immo_2.ExtId = 0X1CABBBEE;
+  //***************************************************
 
 
   HAL_UART_Receive_IT(&huart1, (uint8_t *)get_data, 1);
@@ -287,7 +364,7 @@ int main(void)
 
      adc_hal_res =  HAL_ADC_Start_DMA(&hadc1, (uint32_t *) adc_res, 5);
 
-
+     HAL_UART_Receive_DMA(&huart3,  uart_buff , 12); //tag code are 12 digits!
 
 
   /* USER CODE END 2 */
@@ -327,6 +404,9 @@ int main(void)
   /* creation of calculate */
   calculateHandle = osThreadNew(make_engine_data, NULL, &calculate_attributes);
 
+  /* creation of make_immo_data */
+  make_immo_dataHandle = osThreadNew(make_immo_data_func, NULL, &make_immo_data_attributes);
+
   /* USER CODE BEGIN RTOS_THREADS */
   /* add threads, ... */
   /* USER CODE END RTOS_THREADS */
@@ -344,8 +424,6 @@ int main(void)
   /* USER CODE BEGIN WHILE */
   while (1)
   {
-
-/*
 
 
 
@@ -565,6 +643,39 @@ static void MX_USART1_UART_Init(void)
 }
 
 /**
+  * @brief USART3 Initialization Function
+  * @param None
+  * @retval None
+  */
+static void MX_USART3_UART_Init(void)
+{
+
+  /* USER CODE BEGIN USART3_Init 0 */
+
+  /* USER CODE END USART3_Init 0 */
+
+  /* USER CODE BEGIN USART3_Init 1 */
+
+  /* USER CODE END USART3_Init 1 */
+  huart3.Instance = USART3;
+  huart3.Init.BaudRate = 9600;
+  huart3.Init.WordLength = UART_WORDLENGTH_8B;
+  huart3.Init.StopBits = UART_STOPBITS_1;
+  huart3.Init.Parity = UART_PARITY_NONE;
+  huart3.Init.Mode = UART_MODE_TX_RX;
+  huart3.Init.HwFlowCtl = UART_HWCONTROL_NONE;
+  huart3.Init.OverSampling = UART_OVERSAMPLING_16;
+  if (HAL_UART_Init(&huart3) != HAL_OK)
+  {
+    Error_Handler();
+  }
+  /* USER CODE BEGIN USART3_Init 2 */
+
+  /* USER CODE END USART3_Init 2 */
+
+}
+
+/**
   * Enable DMA controller clock
   */
 static void MX_DMA_Init(void)
@@ -572,8 +683,12 @@ static void MX_DMA_Init(void)
 
   /* DMA controller clock enable */
   __HAL_RCC_DMA2_CLK_ENABLE();
+  __HAL_RCC_DMA1_CLK_ENABLE();
 
   /* DMA interrupt init */
+  /* DMA1_Stream1_IRQn interrupt configuration */
+  HAL_NVIC_SetPriority(DMA1_Stream1_IRQn, 5, 0);
+  HAL_NVIC_EnableIRQ(DMA1_Stream1_IRQn);
   /* DMA2_Stream0_IRQn interrupt configuration */
   HAL_NVIC_SetPriority(DMA2_Stream0_IRQn, 5, 0);
   HAL_NVIC_EnableIRQ(DMA2_Stream0_IRQn);
@@ -592,20 +707,22 @@ static void MX_GPIO_Init(void)
 /* USER CODE END MX_GPIO_Init_1 */
 
   /* GPIO Ports Clock Enable */
-  __HAL_RCC_GPIOE_CLK_ENABLE();
+  __HAL_RCC_GPIOC_CLK_ENABLE();
   __HAL_RCC_GPIOH_CLK_ENABLE();
   __HAL_RCC_GPIOA_CLK_ENABLE();
   __HAL_RCC_GPIOD_CLK_ENABLE();
+  __HAL_RCC_GPIOB_CLK_ENABLE();
+  __HAL_RCC_GPIOE_CLK_ENABLE();
 
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(GPIOD, GPIO_PIN_10|GPIO_PIN_11|GPIO_PIN_12|GPIO_PIN_13
                           |GPIO_PIN_14|GPIO_PIN_15|GPIO_PIN_7, GPIO_PIN_RESET);
 
-  /*Configure GPIO pins : inc_rpm_Pin dec_rpm_Pin */
-  GPIO_InitStruct.Pin = inc_rpm_Pin|dec_rpm_Pin;
+  /*Configure GPIO pin : inc_rpm_Pin */
+  GPIO_InitStruct.Pin = inc_rpm_Pin;
   GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
   GPIO_InitStruct.Pull = GPIO_NOPULL;
-  HAL_GPIO_Init(GPIOE, &GPIO_InitStruct);
+  HAL_GPIO_Init(inc_rpm_GPIO_Port, &GPIO_InitStruct);
 
   /*Configure GPIO pins : PD10 PD11 PD12 PD13
                            PD14 PD15 PD7 */
@@ -615,6 +732,12 @@ static void MX_GPIO_Init(void)
   GPIO_InitStruct.Pull = GPIO_NOPULL;
   GPIO_InitStruct.Speed = GPIO_SPEED_FREQ_LOW;
   HAL_GPIO_Init(GPIOD, &GPIO_InitStruct);
+
+  /*Configure GPIO pin : dec_rpm_Pin */
+  GPIO_InitStruct.Pin = dec_rpm_Pin;
+  GPIO_InitStruct.Mode = GPIO_MODE_INPUT;
+  GPIO_InitStruct.Pull = GPIO_NOPULL;
+  HAL_GPIO_Init(dec_rpm_GPIO_Port, &GPIO_InitStruct);
 
 /* USER CODE BEGIN MX_GPIO_Init_2 */
 /* USER CODE END MX_GPIO_Init_2 */
@@ -758,12 +881,206 @@ void  write_fan_status(){
 
 }
 
+void get_time(int *hours , int *minutes , int *seconds){
+
+	uint32_t totalSeconds = HAL_GetTick() /1000;
+
+	   *hours = totalSeconds / 3600;          // Calculate hours
+	    *minutes = (totalSeconds % 3600) / 60; // Calculate minutes
+	    *seconds = totalSeconds % 60;
+
+}
+
+char * make_string_time(int hour , int minute){
+
+	char __hour[5] , __minute[5];
+
+	static char result [15];
+	memset(result , 0 , 15);
+
+	itoa(hour , __hour , 10);
+	itoa(minute , __minute , 10);
+
+	strcpy(result , __hour);
+	strcat(result , __minute);
+
+	return result;
+
+}
+  char * make_encrypted_data(char *plain_text){
+
+	static char result[16];
+	memset(result , 0 , 16);
+
+	//add padding!
+	if(strlen(plain_text)!=16){
+
+		for(int i= strlen(plain_text); i<16; i++)
+
+			plain_text[i]='F';
+	}
+
+    mbedtls_aes_init(&aes);
+     mbedtls_aes_setkey_enc(&aes, key, 128);
+	//int __index = strlen(plain_text); //since we have data less than 16 bytes we must complete it
+
+
+	 // mbedtls_aes_crypt_cbc(&aes, MBEDTLS_AES_ENCRYPT, 16, iv, (unsigned char *)plain_text, (unsigned char *)result);
+
+	//mbedtls_aes_crypt_cbc(&aes, MBEDTLS_AES_ENCRYPT, 16, (unsigned char *)iv, (unsigned char *)plain_text, (unsigned char *)result);
+
+	mbedtls_aes_crypt_ecb(&aes, MBEDTLS_AES_ENCRYPT, (unsigned char *) plain_text, (unsigned char *)result);
+
+ 	 strcpy(temp_result , result);
+ 	 //for(int i=0; i<16; i++)
+ 	// sprintf("%02X " , temp_result[i]);
+ 	 HAL_UART_Transmit(&huart1, (uint8_t *)"input data:", 12, HAL_MAX_DELAY);
+ 	 	HAL_Delay(500);
+ 	 	 HAL_UART_Transmit(&huart1, (uint8_t *)plain_text, strlen(plain_text), HAL_MAX_DELAY);
+ 	 	 	 	 HAL_Delay(500);
+ 	 	 HAL_UART_Transmit(&huart1, (uint8_t *)"\n", 1, HAL_MAX_DELAY);
+ 	 	 HAL_Delay(500);
+ 	 	 HAL_UART_Transmit(&huart1, (uint8_t *)"coded data:", 12, HAL_MAX_DELAY);
+ 	 	 	 	HAL_Delay(500);
+ 	 HAL_UART_Transmit(&huart1, (uint8_t *)temp_result, 16, HAL_MAX_DELAY);
+ 	 HAL_Delay(500);
+ 	HAL_UART_Transmit(&huart1, (uint8_t *)"\n", 1, HAL_MAX_DELAY);
+ 	 HAL_Delay(500);
+	 mbedtls_aes_free(&aes);
+    return result;
+	}
+
+  char *make_decrypted_data(char *cipher_text){
+
+	 static char result[16];
+
+	    mbedtls_aes_init(&aes);
+	     mbedtls_aes_setkey_dec(&aes, key, 128);
+
+	 mbedtls_aes_crypt_ecb(&aes, MBEDTLS_AES_DECRYPT, (unsigned char *) cipher_text, (unsigned char *)result);
+	//mbedtls_aes_crypt_cbc(&aes, MBEDTLS_AES_DECRYPT, 16, (unsigned char *)iv, (unsigned char *)cipher_text, (unsigned char *)result);
+
+
+   HAL_UART_Transmit(&huart1, (uint8_t *)"decoded data:", 13, HAL_MAX_DELAY);
+   	// HAL_Delay(500);
+
+  HAL_UART_Transmit(&huart1, (uint8_t *)result, strlen(result), HAL_MAX_DELAY);
+  	 //HAL_Delay(500);
+  	 HAL_UART_Transmit(&huart1, (uint8_t *)"\n", 1, HAL_MAX_DELAY);
+  	 //HAL_Delay(500);
+
+  	 mbedtls_aes_free(&aes);
+
+  return result;
+
+  }
+
+  void send_encrypted_immo_data(char *cipher_text){
+
+	  uint8_t first_byte[8];
+	  uint8_t second_byte[8];
+
+
+	  for(int i=0; i<8 ; i++)
+		  first_byte[i] = (uint8_t)cipher_text[i];
+
+	  int j=0;
+	  for(int i=8; i<16 ; i++){
+	 		  second_byte[j] = (uint8_t)cipher_text[i];
+	 		  j++;
+	  }
+
+	  HAL_CAN_AddTxMessage(&hcan1, &immo_1, first_byte, &tx_mail_box);
+	  HAL_Delay(500);
+	  HAL_CAN_AddTxMessage(&hcan1, &immo_2, second_byte, &tx_mail_box);
+	  HAL_Delay(500);
+
+  }
+
+  uint8_t convert_can_message_immo(char *res){
+
+	  int j= 8;
+
+	  uint8_t result = 0;
+
+	  const char *m1 = "first immo received\n";
+	  const char *m2 = "second immo received\n";
+
+
+	  if(RxHeader.ExtId == 0X1CABBAEE){
+        for(int i=0; i<8; i++)
+        	get_encrypted_immo_data[i] = rx_data[i];
+        result++;
+       // HAL_UART_Transmit(&huart1, (uint8_t *)rx_data, 8, HAL_MAX_DELAY);
+       // HAL_UART_Transmit(&huart1, (uint8_t *)"\n", 1, HAL_MAX_DELAY);
+       // HAL_Delay(500);
+        read_first_byte = 1;
+
+	  }
+
+
+	  if(RxHeader.ExtId == 0X1CABBBEE){
+
+		  result++;
+
+		 // HAL_UART_Transmit(&huart1, (uint8_t *)rx_data, 8, HAL_MAX_DELAY);
+		  //HAL_UART_Transmit(&huart1, (uint8_t *)"\n", 1, HAL_MAX_DELAY);
+
+
+		  for(int i = 0; i<8; i++){
+
+			  get_encrypted_immo_data[j] = rx_data[i];
+			  j++;
+		  }
+		  read_second_byte = 1;
+	 	  }
+
+	  return result;
+  }
+
+  void handle_valid_switch_start(){
+
+
+		 char ecu_time[16] = {0}, immo_time[16] = {0};
+		 char decrypted_data[16]= {0};
+
+		 get_time(&_hour, &_minute, &_seconds);
+		 strcpy(ecu_time ,make_string_time(_hour, _minute));
+
+	    strcpy(decrypted_data , make_decrypted_data(get_encrypted_immo_data));
+
+	    for(int i=0; i<16;i++){
+
+	    	    if(decrypted_data[i] == 'F')
+	    	    	break;
+
+	   			 immo_time[i] = decrypted_data[i];
+
+	   		 }
+	    HAL_UART_Transmit(&huart1, (uint8_t *)"immo time:", 10, HAL_MAX_DELAY);
+	    HAL_UART_Transmit(&huart1, (uint8_t *)immo_time, strlen(immo_time), HAL_MAX_DELAY);
+	    HAL_UART_Transmit(&huart1, (uint8_t *)"\n", 1, HAL_MAX_DELAY);
+	    if(strcmp(ecu_time , immo_time)==0){
+
+	    	_engine_start_valid_ = OK_PERMISSION;
+	    HAL_UART_Transmit(&huart1, (uint8_t *)"VALID SWITCH\n", 13, HAL_MAX_DELAY);
+	    }
+
+
+
+  }
+
 void HAL_CAN_RxFifo0MsgPendingCallback(CAN_HandleTypeDef *hcan){
 
 
 
-   if(HAL_CAN_GetRxMessage(hcan, CAN_RX_FIFO0, &RxHeader, rx_data) == HAL_OK)
+   if(HAL_CAN_GetRxMessage(hcan, CAN_RX_FIFO0, &RxHeader, rx_data) == HAL_OK){
 	   get_message = 1;
+   convert_can_message_immo("salam");
+   if(read_first_byte == 1 && read_second_byte == 1)
+	   handle_valid_switch_start();
+}
+
 
 }
 
@@ -799,6 +1116,11 @@ void StartDefaultTask(void *argument)
   /* Infinite loop */
   for(;;)
   {
+	//  if(immo_read_ok ==2)
+	//make_decrypted_data(get_encrypted_immo_data);
+	 // HAL_UART_Transmit(&huart1, (uint8_t *)uart_buff, 12, HAL_MAX_DELAY);
+	  //HAL_Delay(500);
+
     osDelay(1);
   }
   /* USER CODE END 5 */
@@ -819,6 +1141,16 @@ void display_data(void *argument)
   /* Infinite loop */
   for(;;)
   {
+	    while(_engine_start_valid_ == NO_PERMISSION){
+
+	    	LCD16X2_Set_Cursor(MyLCD, 1, 1);
+	    		  	  LCD16X2_Write_String(MyLCD, "NO VALID SWITCH!");
+	    	HAL_Delay(500);
+	    }
+
+	   // else  if(_engine_start_valid_ == OK_PERMISSION)
+	    {
+
 	  	  LCD16X2_Set_Cursor(MyLCD, 1, 1);
 	  	  LCD16X2_Write_String(MyLCD, "RPM:");
 
@@ -839,11 +1171,11 @@ void display_data(void *argument)
 
 	  	  write_fan_status();
 
-
-
-	  	  HAL_Delay(500);
+	  	 osDelay(100);
 
 	  	  LCD16X2_Clear(MyLCD);
+
+	    }
   }
   /* USER CODE END display_data */
 }
@@ -861,6 +1193,11 @@ void can_send_data(void *argument)
   /* Infinite loop */
   for(;;)
   {
+	   while(_engine_start_valid_ == NO_PERMISSION){
+	    	   HAL_Delay(50);
+	    }
+	   //(_engine_start_valid_ == OK_PERMISSION)
+			   {
 	  /*RES = */HAL_CAN_AddTxMessage(&hcan1, &engine_rpm_header, rpm_data, &tx_mail_box);
 		     HAL_Delay(50);
 
@@ -884,12 +1221,14 @@ void can_send_data(void *argument)
 		     strcat(data_to_send , ",");
 		     }
 		     strcat(data_to_send, "\n");
+		     }
 		    //  if(strstr(UART_RX_BUFF , "SALAM")){
-		     HAL_UART_Transmit(&huart1, (uint8_t *) "can ok\n", 7, HAL_MAX_DELAY);
-		     HAL_Delay(100);
+		    // HAL_UART_Transmit(&huart1, (uint8_t *) "can ok\n", 7, HAL_MAX_DELAY);
+		     //HAL_Delay(100);
 
-		     /* UART_RES = */HAL_UART_Transmit(&huart1, (uint8_t *) UART_RX_BUFF, sizeof(UART_RX_BUFF), HAL_MAX_DELAY);
+		     /* UART_RES =HAL_UART_Transmit(&huart1, (uint8_t *) UART_RX_BUFF, sizeof(UART_RX_BUFF), HAL_MAX_DELAY);
 			  HAL_Delay(100);
+			  */
 		     }
   }
   /* USER CODE END can_send_data */
@@ -928,11 +1267,42 @@ void make_engine_data(void *argument)
   /* Infinite loop */
   for(;;)
   {
+
     make_coolant_can_data(coolant_value);
     make_rpm_can_data(input_rpm);
     make_fan_can_data(coolant_value);
   }
   /* USER CODE END make_engine_data */
+}
+
+/* USER CODE BEGIN Header_make_immo_data_func */
+/**
+* @brief Function implementing the make_immo_data thread.
+* @param argument: Not used
+* @retval None
+*/
+/* USER CODE END Header_make_immo_data_func */
+void make_immo_data_func(void *argument)
+{
+  /* USER CODE BEGIN make_immo_data_func */
+
+  /* Infinite loop */
+  for(;;)
+  {
+     if(strcmp(uart_buff , immo_code) == 0){ //valid tag
+	 get_time(&_hour, &_minute, &_seconds);
+	 char time_string[15];
+	 char data_to_send[64];
+	 strcpy(time_string , make_string_time(_hour , _minute));
+	 strcpy(data_to_send ,make_encrypted_data(time_string));
+	// make_decrypted_data(data_to_send);
+	 send_encrypted_immo_data(data_to_send);
+     }
+	// HAL_UART_Transmit(&huart1, (uint8_t *)data_to_send, strlen(data_to_send), HAL_MAX_DELAY);
+	// HAL_Delay(1000);
+    osDelay(1);
+  }
+  /* USER CODE END make_immo_data_func */
 }
 
 /**

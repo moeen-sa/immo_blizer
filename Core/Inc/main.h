@@ -57,9 +57,9 @@ void Error_Handler(void);
 /* USER CODE END EFP */
 
 /* Private defines -----------------------------------------------------------*/
-#define inc_rpm_Pin GPIO_PIN_4
-#define inc_rpm_GPIO_Port GPIOE
-#define dec_rpm_Pin GPIO_PIN_5
+#define inc_rpm_Pin GPIO_PIN_13
+#define inc_rpm_GPIO_Port GPIOC
+#define dec_rpm_Pin GPIO_PIN_1
 #define dec_rpm_GPIO_Port GPIOE
 
 /* USER CODE BEGIN Private defines */
